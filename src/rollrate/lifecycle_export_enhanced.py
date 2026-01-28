@@ -52,6 +52,7 @@ def export_lifecycle_with_config_info(
     with pd.ExcelWriter(filename, engine="xlsxwriter", datetime_format="yyyy-mm-dd") as writer:
 
         workbook = writer.book
+        max_mob_limit = config_params.get("MAX_MOB", None)
 
         # ============================
         # 1. CREATE CONFIG_INFO SHEET
@@ -85,12 +86,14 @@ def export_lifecycle_with_config_info(
             "num_format": "0.00%",
         })
 
-        fmt_red_bottom = workbook.add_format({
+        # Forecast start marker: nền vàng, kẻ viền trên & trái đỏ đậm để đánh dấu ô forecast đầu tiên
+        fmt_forecast_start = workbook.add_format({
+            "bg_color": "#FFF3B0",
             "border": 1,
-            "bottom": 5,
-            "bottom_color": "red",
-            "right": 5,
-            "right_color": "red",
+            "top": 5,
+            "top_color": "red",
+            "left": 5,
+            "left_color": "red",
             "num_format": "0.00%",
         })
 
@@ -190,10 +193,10 @@ def export_lifecycle_with_config_info(
                             value = raw_value
 
                         # Chọn format actual vs forecast
-                        if (max_actual is not None) and (mob > max_actual):
+                        if (max_actual is not None) and (mob == max_actual + 1):
+                            fmt = fmt_forecast_start  # ô forecast đầu tiên: đánh dấu ranh với viền đỏ trên & trái
+                        elif (max_actual is not None) and (mob > max_actual):
                             fmt = fmt_forecast
-                        elif (max_actual is not None) and (mob == max_actual):
-                            fmt = fmt_red_bottom
                         else:
                             fmt = fmt_data
 
