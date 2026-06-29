@@ -20,6 +20,9 @@ except Exception:
     _HAS_CVXPY = False
 
 
+_USE_CONFIG_POST_MATURE = object()
+
+
 def validate_transition_matrices(P_by_mob, tol=1e-6):
     """Validate each P_m is square and row-stochastic (rows sum to 1)."""
     for mob, mat in P_by_mob.items():
@@ -64,7 +67,7 @@ def weighted_median(values, weights):
 
 
 def del30_from_v(v, s30_idx):
-    """Compute DEL30 as sum of the 30+ state probabilities (or shares)."""
+    """Compute a delinquency metric as sum of selected state probabilities (or shares)."""
     return float(np.sum(v[s30_idx]))
 
 
@@ -547,6 +550,7 @@ def fit_alpha_segmented(
     weight_mode="ead",
     tol=1e-6,
     check_P=True,
+    post_mature_k=_USE_CONFIG_POST_MATURE,
 ):
     """
     Optional Step 7: scale k by alpha to best fit a long-horizon MOB target.
@@ -670,14 +674,14 @@ def fit_alpha_segmented(
     if K_GLOBAL_MULTIPLIER is not None and K_GLOBAL_MULTIPLIER != 1.0:
         k_final = {m: float(np.clip(k * K_GLOBAL_MULTIPLIER, 0.0, 1.0)) for m, k in k_final.items()}
     
-    # Apply K_POST_MATURE từ config nếu được cấu hình
-    # K_POST_MATURE: Giá trị K cố định cho MOB >= mob_target
-    # Mục đích: Giảm slope của DEL curve sau khi mature
-    # Lưu ý: K_POST_MATURE được áp dụng SAU K_GLOBAL_MULTIPLIER
-    from src.config import K_POST_MATURE
-    if K_POST_MATURE is not None:
+    # Apply post-mature K override after global scaling.
+    # Default behavior preserves the existing config-driven override.
+    if post_mature_k is _USE_CONFIG_POST_MATURE:
+        from src.config import K_POST_MATURE
+        post_mature_k = K_POST_MATURE
+    if post_mature_k is not None:
         for mob in range(mob_target, max(k_final.keys()) + 1 if k_final else mob_target + 1):
-            k_final[mob] = float(K_POST_MATURE)
+            k_final[mob] = float(post_mature_k)
     
     return best_alpha, k_final, score_df
 

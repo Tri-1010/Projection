@@ -407,7 +407,7 @@ def allocate_multi_mob_fast(
     
     # Các cột cần lấy từ df_loans_latest
     base_cols = [
-        loan_col, 'PRODUCT_TYPE', 'RISK_SCORE', 'VINTAGE_DATE',
+        loan_col, 'PRODUCT_TYPE', 'RISK_SCORE', 'VINTAGE_DATE','SALE_CHANNEL',
         CFG["mob"], CFG["ead"], CFG["state"]
     ]
     

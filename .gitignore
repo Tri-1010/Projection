@@ -12,3 +12,7 @@ notebooks/V11.ipynb
 # Allow specific parquet snapshots for ETB exports
 !ETB_Parquet_YYYYMM/
 !ETB_Parquet_YYYYMM/*.parquet
+
+# Allow specific parquet snapshots for POS MSCORE V2 exports
+!POS_Parquet_MSCORE_V2/
+!POS_Parquet_MSCORE_V2/*.parquet

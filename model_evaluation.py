@@ -81,8 +81,16 @@ def run_out_of_time_backtest(actual_results, matrices_by_mob, parent_fallback,
                 continue
             
             actual_amounts = actual_data[mob]
-            del30_actual = sum(actual_amounts.get(s, 0) for s in s30_states)
-            total_actual = sum(actual_amounts.values())
+            # Handle both dict and array/Series formats
+            if isinstance(actual_amounts, dict):
+                del30_actual = sum(actual_amounts.get(s, 0) for s in s30_states)
+                total_actual = sum(actual_amounts.values())
+            elif hasattr(actual_amounts, 'index'):
+                del30_actual = sum(actual_amounts.get(s, 0) for s in s30_states if s in actual_amounts.index)
+                total_actual = actual_amounts.sum()
+            else:
+                del30_actual = np.sum(actual_amounts)
+                total_actual = np.sum(actual_amounts)
             
             if total_actual > 0:
                 del30_rate = del30_actual / total_actual
@@ -216,8 +224,16 @@ def compare_with_without_k(actual_results, matrices_by_mob, parent_fallback,
                 continue
             
             actual_amounts = actual_data[mob]
-            del30_actual = sum(actual_amounts.get(s, 0) for s in s30_states)
-            total_actual = sum(actual_amounts.values())
+            # Handle both dict and array/Series formats
+            if isinstance(actual_amounts, dict):
+                del30_actual = sum(actual_amounts.get(s, 0) for s in s30_states)
+                total_actual = sum(actual_amounts.values())
+            elif hasattr(actual_amounts, 'index'):
+                del30_actual = sum(actual_amounts.get(s, 0) for s in s30_states if s in actual_amounts.index)
+                total_actual = actual_amounts.sum()
+            else:
+                del30_actual = np.sum(actual_amounts)
+                total_actual = np.sum(actual_amounts)
             
             if total_actual == 0:
                 continue
@@ -507,8 +523,16 @@ def run_full_evaluation(actual_results, matrices_by_mob, parent_fallback,
                 continue
             
             actual_amounts = actual_data[mob]
-            del30_actual = sum(actual_amounts.get(s, 0) for s in s30_states)
-            total_actual = sum(actual_amounts.values())
+            # Handle both dict and array/Series formats
+            if isinstance(actual_amounts, dict):
+                del30_actual = sum(actual_amounts.get(s, 0) for s in s30_states)
+                total_actual = sum(actual_amounts.values())
+            elif hasattr(actual_amounts, 'index'):
+                del30_actual = sum(actual_amounts.get(s, 0) for s in s30_states if s in actual_amounts.index)
+                total_actual = actual_amounts.sum()
+            else:
+                del30_actual = np.sum(actual_amounts)
+                total_actual = np.sum(actual_amounts)
             
             if total_actual > 0:
                 del30_rate = del30_actual / total_actual

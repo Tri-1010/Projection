@@ -1,0 +1,461 @@
+"""
+Script tạo notebook Markovchain_Cohort_Comparison.ipynb
+Copy từ Markovchain.ipynb và thêm section so sánh cohort từ MOB sớm
+"""
+import json
+import shutil
+
+# Copy notebook gốc
+shutil.copy('notebooks/Markovchain.ipynb', 'notebooks/Markovchain_Cohort_Comparison.ipynb')
+
+# Đọc notebook
+with open('notebooks/Markovchain_Cohort_Comparison.ipynb', 'r', encoding='utf-8') as f:
+    nb = json.load(f)
+
+# Thêm import forecast_segment_partial_step vào cell đầu tiên
+for cell in nb['cells']:
+    if cell['cell_type'] == 'code':
+        source = ''.join(cell['source'])
+        if 'from src.rollrate.calibration_kmob import' in source:
+            # Thêm forecast_segment_partial_step
+            new_source = source.replace(
+                'forecast_all_vintages_partial_step,',
+                'forecast_all_vintages_partial_step,\n    forecast_segment_partial_step,'
+            )
+            cell['source'] = new_source.split('\n')
+            cell['source'] = [line + '\n' for line in cell['source'][:-1]] + [cell['source'][-1]]
+            break
+
+# Thêm các cells mới cho cohort comparison
+new_cells = [
+    {
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": [
+            "## 📊 COHORT COMPARISON: Forecast từ MOB sớm\n",
+            "\n",
+            "So sánh Actual vs Forecast (No K) vs Forecast (With K) cho cohort cụ thể\n",
+            "\n",
+            "**Logic**:\n",
+            "- Forecast bắt đầu từ MOB=3 (không phải từ MOB cuối cùng)\n",
+            "- DEL30_PCT = DEL30_AMT / DISB_TOTAL\n",
+            "- K < 1 → Forecast (With K) thấp hơn Forecast (No K)"
+        ]
+    },
+    {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "# ============================================================\n",
+            "# COHORT COMPARISON CONFIG\n",
+            "# ============================================================\n",
+            "\n",
+            "TARGET_COHORT = '2023-12'  # Cohort cần so sánh\n",
+            "START_MOB = 3  # Forecast bắt đầu từ MOB này\n",
+            "\n",
+            "print(f'🔍 Tìm cohort: {TARGET_COHORT}')\n",
+            "print(f'   Forecast từ MOB: {START_MOB}')"
+        ]
+    },
+    {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "# ============================================================\n",
+            "# TÌM COHORT VÀ CHỌN SEGMENT\n",
+            "# ============================================================\n",
+            "\n",
+            "# Tìm tất cả keys có vintage = TARGET_COHORT\n",
+            "matching_keys = []\n",
+            "for key in actual_results.keys():\n",
+            "    product, score, vintage = key\n",
+            "    vintage_dt = pd.to_datetime(vintage)\n",
+            "    target_dt = pd.to_datetime(TARGET_COHORT)\n",
+            "    if vintage_dt.year == target_dt.year and vintage_dt.month == target_dt.month:\n",
+            "        max_mob = max(actual_results[key].keys())\n",
+            "        matching_keys.append((key, max_mob))\n",
+            "        print(f'   Found: {product}/{score}/{vintage} - max MOB: {max_mob}')\n",
+            "\n",
+            "if not matching_keys:\n",
+            "    print(f'❌ Không tìm thấy cohort {TARGET_COHORT}!')\n",
+            "    print('\\n📊 Các vintage có sẵn (10 gần nhất):')\n",
+            "    vintages = set()\n",
+            "    for key in actual_results.keys():\n",
+            "        vintages.add(pd.to_datetime(key[2]).strftime('%Y-%m'))\n",
+            "    for v in sorted(vintages)[-10:]:\n",
+            "        print(f'   {v}')\n",
+            "else:\n",
+            "    print(f'\\n✅ Tìm thấy {len(matching_keys)} segments cho cohort {TARGET_COHORT}')"
+        ]
+    },
+    {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "# ============================================================\n",
+            "# CHỌN SEGMENT PHÙ HỢP\n",
+            "# ============================================================\n",
+            "\n",
+            "selected_key = None\n",
+            "if matching_keys:\n",
+            "    # Chọn segment có nhiều MOB nhất\n",
+            "    matching_keys.sort(key=lambda x: x[1], reverse=True)\n",
+            "    for key, max_mob in matching_keys:\n",
+            "        if max_mob >= START_MOB + 3:  # Cần ít nhất 3 MOBs sau START_MOB\n",
+            "            selected_key = key\n",
+            "            break\n",
+            "    \n",
+            "    if selected_key is None:\n",
+            "        selected_key = matching_keys[0][0]\n",
+            "\n",
+            "if selected_key:\n",
+            "    product, score, vintage = selected_key\n",
+            "    print(f'\\n✅ Selected segment: {product}/{score}/{vintage}')\n",
+            "    print(f'   Max actual MOB: {max(actual_results[selected_key].keys())}')\n",
+            "else:\n",
+            "    print('❌ Không có segment phù hợp')"
+        ]
+    },
+    {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "# ============================================================\n",
+            "# TÍNH DEL30+ CHO ACTUAL, FORECAST NO K, FORECAST WITH K\n",
+            "# ============================================================\n",
+            "\n",
+            "if selected_key:\n",
+            "    product, score, vintage = selected_key\n",
+            "    mob_dict = actual_results[selected_key]\n",
+            "    \n",
+            "    # Lấy DISB_TOTAL\n",
+            "    disb_total = disb_total_by_vintage.get(selected_key, 0)\n",
+            "    print(f'📊 DISB_TOTAL: {disb_total:,.0f}')\n",
+            "    \n",
+            "    if disb_total <= 0:\n",
+            "        print('❌ DISB_TOTAL = 0, không thể tính DEL30_PCT')\n",
+            "    else:\n",
+            "        # Kiểm tra START_MOB có trong data không\n",
+            "        available_mobs = sorted(mob_dict.keys())\n",
+            "        if START_MOB not in mob_dict:\n",
+            "            print(f'⚠️ MOB {START_MOB} không có trong actual data')\n",
+            "            print(f'   Available MOBs: {available_mobs}')\n",
+            "            START_MOB = min(available_mobs)\n",
+            "            print(f'   → Sử dụng START_MOB = {START_MOB}')\n",
+            "        \n",
+            "        initial_ead = mob_dict[START_MOB]\n",
+            "        print(f'\\n📊 Initial EAD at MOB {START_MOB}:')\n",
+            "        print(f'   Total EAD: {initial_ead.sum():,.0f}')\n",
+            "        del30_initial = sum(initial_ead.get(b, 0) for b in BUCKETS_30P)\n",
+            "        print(f'   DEL30_AMT: {del30_initial:,.0f}')\n",
+            "        print(f'   DEL30_PCT: {del30_initial/disb_total*100:.2f}%')"
+        ]
+    },
+    {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "# ============================================================\n",
+            "# FORECAST VỚI K VÀ KHÔNG K\n",
+            "# ============================================================\n",
+            "\n",
+            "if selected_key and disb_total > 0:\n",
+            "    # Forecast với K (k_final_by_mob)\n",
+            "    fc_with_k = forecast_segment_partial_step(\n",
+            "        matrices_by_mob=matrices_by_mob,\n",
+            "        parent_fallback=parent_fallback,\n",
+            "        product=product,\n",
+            "        score=score,\n",
+            "        start_mob=START_MOB,\n",
+            "        initial_ead=initial_ead,\n",
+            "        max_mob=MAX_MOB,\n",
+            "        k_by_mob=k_final_by_mob,\n",
+            "        states=BUCKETS_CANON,\n",
+            "    )\n",
+            "    print(f'✅ Forecast With K: {len(fc_with_k)} MOBs')\n",
+            "\n",
+            "    # Forecast không K (k=1.0 cho tất cả MOB)\n",
+            "    k_no_k = {m: 1.0 for m in range(1, MAX_MOB + 1)}\n",
+            "    fc_no_k = forecast_segment_partial_step(\n",
+            "        matrices_by_mob=matrices_by_mob,\n",
+            "        parent_fallback=parent_fallback,\n",
+            "        product=product,\n",
+            "        score=score,\n",
+            "        start_mob=START_MOB,\n",
+            "        initial_ead=initial_ead,\n",
+            "        max_mob=MAX_MOB,\n",
+            "        k_by_mob=k_no_k,\n",
+            "        states=BUCKETS_CANON,\n",
+            "    )\n",
+            "    print(f'✅ Forecast No K: {len(fc_no_k)} MOBs')"
+        ]
+    },
+    {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "# ============================================================\n",
+            "# TÍNH DEL30_PCT CHO CẢ 3 ĐƯỜNG\n",
+            "# ============================================================\n",
+            "\n",
+            "if selected_key and disb_total > 0:\n",
+            "    results = []\n",
+            "    max_actual_mob = max(mob_dict.keys())\n",
+            "    \n",
+            "    for mob in range(START_MOB, MAX_MOB + 1):\n",
+            "        row = {'MOB': mob}\n",
+            "        \n",
+            "        # Actual (chỉ có đến max_actual_mob)\n",
+            "        if mob <= max_actual_mob and mob in mob_dict:\n",
+            "            actual_ead = mob_dict[mob]\n",
+            "            del30_actual = sum(actual_ead.get(b, 0) for b in BUCKETS_30P)\n",
+            "            row['Actual'] = del30_actual / disb_total\n",
+            "        else:\n",
+            "            row['Actual'] = np.nan\n",
+            "        \n",
+            "        # Forecast No K\n",
+            "        if mob in fc_no_k:\n",
+            "            fc_ead_no_k = fc_no_k[mob]\n",
+            "            del30_no_k = sum(fc_ead_no_k.get(b, 0) for b in BUCKETS_30P)\n",
+            "            row['FC_No_K'] = del30_no_k / disb_total\n",
+            "        else:\n",
+            "            row['FC_No_K'] = np.nan\n",
+            "        \n",
+            "        # Forecast With K\n",
+            "        if mob in fc_with_k:\n",
+            "            fc_ead_with_k = fc_with_k[mob]\n",
+            "            del30_with_k = sum(fc_ead_with_k.get(b, 0) for b in BUCKETS_30P)\n",
+            "            row['FC_With_K'] = del30_with_k / disb_total\n",
+            "        else:\n",
+            "            row['FC_With_K'] = np.nan\n",
+            "        \n",
+            "        results.append(row)\n",
+            "    \n",
+            "    df_compare = pd.DataFrame(results)\n",
+            "    print('\\n📊 DEL30+ Rate Comparison:')\n",
+            "    print(df_compare.to_string(index=False))"
+        ]
+    },
+    {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "# ============================================================\n",
+            "# VERIFY: TẠI START_MOB, CẢ 3 ĐƯỜNG PHẢI BẰNG NHAU\n",
+            "# ============================================================\n",
+            "\n",
+            "if selected_key and disb_total > 0:\n",
+            "    start_row = df_compare[df_compare['MOB'] == START_MOB].iloc[0]\n",
+            "    print(f'\\n🔍 VERIFY at MOB {START_MOB}:')\n",
+            "    print(f'   Actual:     {start_row[\"Actual\"]*100:.4f}%')\n",
+            "    print(f'   FC_No_K:    {start_row[\"FC_No_K\"]*100:.4f}%')\n",
+            "    print(f'   FC_With_K:  {start_row[\"FC_With_K\"]*100:.4f}%')\n",
+            "    \n",
+            "    # Check if all 3 are equal\n",
+            "    vals = [start_row['Actual'], start_row['FC_No_K'], start_row['FC_With_K']]\n",
+            "    if all(abs(v - vals[0]) < 1e-6 for v in vals):\n",
+            "        print('   ✅ PASS: Cả 3 đường bằng nhau tại START_MOB')\n",
+            "    else:\n",
+            "        print('   ❌ FAIL: 3 đường KHÔNG bằng nhau!')"
+        ]
+    },
+    {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "# ============================================================\n",
+            "# CHART: SO SÁNH DEL30+ RATE\n",
+            "# ============================================================\n",
+            "\n",
+            "if selected_key and disb_total > 0:\n",
+            "    fig, ax = plt.subplots(figsize=(12, 6))\n",
+            "    \n",
+            "    # Plot Actual\n",
+            "    df_actual_plot = df_compare.dropna(subset=['Actual'])\n",
+            "    ax.plot(df_actual_plot['MOB'], df_actual_plot['Actual'] * 100, 'o-', \n",
+            "            label='Actual', color='blue', linewidth=2, markersize=6)\n",
+            "    \n",
+            "    # Plot Forecast No K\n",
+            "    ax.plot(df_compare['MOB'], df_compare['FC_No_K'] * 100, 's--', \n",
+            "            label='Forecast (No K)', color='red', linewidth=2, markersize=5, alpha=0.8)\n",
+            "    \n",
+            "    # Plot Forecast With K\n",
+            "    ax.plot(df_compare['MOB'], df_compare['FC_With_K'] * 100, '^--', \n",
+            "            label='Forecast (With K)', color='green', linewidth=2, markersize=5, alpha=0.8)\n",
+            "    \n",
+            "    # Vertical line at START_MOB\n",
+            "    ax.axvline(x=START_MOB, color='gray', linestyle=':', alpha=0.5, label=f'Forecast Start (MOB={START_MOB})')\n",
+            "    \n",
+            "    ax.set_xlabel('MOB', fontsize=12)\n",
+            "    ax.set_ylabel('DEL30+ Rate (%)', fontsize=12)\n",
+            "    ax.set_title(f'Cohort {TARGET_COHORT} ({product}/{score})\\nDEL30+ Rate: Actual vs Forecast', fontsize=14, fontweight='bold')\n",
+            "    ax.legend(loc='best')\n",
+            "    ax.grid(True, alpha=0.3)\n",
+            "    \n",
+            "    plt.tight_layout()\n",
+            "    plt.savefig('outputs/cohort_comparison_del30.png', dpi=150, bbox_inches='tight')\n",
+            "    plt.show()"
+        ]
+    },
+    {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "# ============================================================\n",
+            "# MAE / MAPE ANALYSIS\n",
+            "# ============================================================\n",
+            "\n",
+            "if selected_key and disb_total > 0:\n",
+            "    # Chỉ tính error cho các MOB có actual\n",
+            "    df_eval = df_compare.dropna(subset=['Actual']).copy()\n",
+            "    \n",
+            "    # MAE\n",
+            "    df_eval['Error_No_K'] = abs(df_eval['FC_No_K'] - df_eval['Actual'])\n",
+            "    df_eval['Error_With_K'] = abs(df_eval['FC_With_K'] - df_eval['Actual'])\n",
+            "    \n",
+            "    # MAPE (avoid division by zero)\n",
+            "    df_eval['MAPE_No_K'] = np.where(df_eval['Actual'] > 0, \n",
+            "                                    df_eval['Error_No_K'] / df_eval['Actual'] * 100, np.nan)\n",
+            "    df_eval['MAPE_With_K'] = np.where(df_eval['Actual'] > 0, \n",
+            "                                      df_eval['Error_With_K'] / df_eval['Actual'] * 100, np.nan)\n",
+            "    \n",
+            "    print('📊 Error Metrics by MOB:')\n",
+            "    cols_to_show = ['MOB', 'Actual', 'FC_No_K', 'FC_With_K', 'Error_No_K', 'Error_With_K', 'MAPE_No_K', 'MAPE_With_K']\n",
+            "    print(df_eval[cols_to_show].to_string(index=False))\n",
+            "    \n",
+            "    # Summary\n",
+            "    print('\\n📊 Summary:')\n",
+            "    print(f'   MAE (No K):    {df_eval[\"Error_No_K\"].mean()*100:.4f}%')\n",
+            "    print(f'   MAE (With K):  {df_eval[\"Error_With_K\"].mean()*100:.4f}%')\n",
+            "    print(f'   MAPE (No K):   {df_eval[\"MAPE_No_K\"].mean():.2f}%')\n",
+            "    print(f'   MAPE (With K): {df_eval[\"MAPE_With_K\"].mean():.2f}%')\n",
+            "    \n",
+            "    # Which is better?\n",
+            "    if df_eval['Error_With_K'].mean() < df_eval['Error_No_K'].mean():\n",
+            "        print('\\n✅ Forecast With K có MAE thấp hơn → K calibration cải thiện accuracy')\n",
+            "    else:\n",
+            "        print('\\n⚠️ Forecast No K có MAE thấp hơn → K calibration không cải thiện')"
+        ]
+    },
+    {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "# ============================================================\n",
+            "# CHART MAE/MAPE BY MOB\n",
+            "# ============================================================\n",
+            "\n",
+            "if selected_key and disb_total > 0:\n",
+            "    fig, axes = plt.subplots(2, 2, figsize=(14, 10))\n",
+            "    \n",
+            "    # Plot 1: MAE by MOB\n",
+            "    ax1 = axes[0, 0]\n",
+            "    ax1.plot(df_eval['MOB'], df_eval['Error_No_K'] * 100, 'o-', label='No K', color='red')\n",
+            "    ax1.plot(df_eval['MOB'], df_eval['Error_With_K'] * 100, 's-', label='With K', color='green')\n",
+            "    ax1.set_xlabel('MOB')\n",
+            "    ax1.set_ylabel('Absolute Error (%)')\n",
+            "    ax1.set_title('MAE by MOB')\n",
+            "    ax1.legend()\n",
+            "    ax1.grid(True, alpha=0.3)\n",
+            "    \n",
+            "    # Plot 2: MAPE by MOB\n",
+            "    ax2 = axes[0, 1]\n",
+            "    ax2.plot(df_eval['MOB'], df_eval['MAPE_No_K'], 'o-', label='No K', color='red')\n",
+            "    ax2.plot(df_eval['MOB'], df_eval['MAPE_With_K'], 's-', label='With K', color='green')\n",
+            "    ax2.set_xlabel('MOB')\n",
+            "    ax2.set_ylabel('MAPE (%)')\n",
+            "    ax2.set_title('MAPE by MOB')\n",
+            "    ax2.legend()\n",
+            "    ax2.grid(True, alpha=0.3)\n",
+            "    \n",
+            "    # Plot 3: Cumulative MAE\n",
+            "    ax3 = axes[1, 0]\n",
+            "    ax3.plot(df_eval['MOB'], df_eval['Error_No_K'].cumsum() * 100, 'o-', label='No K', color='red')\n",
+            "    ax3.plot(df_eval['MOB'], df_eval['Error_With_K'].cumsum() * 100, 's-', label='With K', color='green')\n",
+            "    ax3.set_xlabel('MOB')\n",
+            "    ax3.set_ylabel('Cumulative Error (%)')\n",
+            "    ax3.set_title('Cumulative MAE')\n",
+            "    ax3.legend()\n",
+            "    ax3.grid(True, alpha=0.3)\n",
+            "    \n",
+            "    # Plot 4: K values used\n",
+            "    ax4 = axes[1, 1]\n",
+            "    mobs_plot = sorted([m for m in k_final_by_mob.keys() if START_MOB <= m <= MAX_MOB])\n",
+            "    k_vals = [k_final_by_mob.get(m, 1.0) for m in mobs_plot]\n",
+            "    ax4.plot(mobs_plot, k_vals, 'o-', color='purple')\n",
+            "    ax4.axhline(y=1.0, color='gray', linestyle='--', alpha=0.5, label='K=1 (No adjustment)')\n",
+            "    ax4.set_xlabel('MOB')\n",
+            "    ax4.set_ylabel('K Value')\n",
+            "    ax4.set_title('K Values by MOB')\n",
+            "    ax4.legend()\n",
+            "    ax4.grid(True, alpha=0.3)\n",
+            "    \n",
+            "    plt.tight_layout()\n",
+            "    plt.savefig('outputs/cohort_comparison_mae_mape.png', dpi=150, bbox_inches='tight')\n",
+            "    plt.show()"
+        ]
+    },
+    {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "# ============================================================\n",
+            "# SUMMARY\n",
+            "# ============================================================\n",
+            "\n",
+            "if selected_key and disb_total > 0:\n",
+            "    print('='*60)\n",
+            "    print('📊 COHORT COMPARISON SUMMARY')\n",
+            "    print('='*60)\n",
+            "    print(f'\\nCohort: {TARGET_COHORT} ({product}/{score})')\n",
+            "    print(f'DISB_TOTAL: {disb_total:,.0f}')\n",
+            "    print(f'Forecast Start: MOB {START_MOB}')\n",
+            "    print(f'Max Actual MOB: {max(mob_dict.keys())}')\n",
+            "    print(f'\\nK Calibration:')\n",
+            "    print(f'   Method: WLS_REG (lambda={LAMBDA_K}, prior={K_PRIOR})')\n",
+            "    print(f'   Alpha: {alpha:.4f}')\n",
+            "    print(f'   Mean K: {np.mean(list(k_final_by_mob.values())):.4f}')\n",
+            "    print(f'\\nAccuracy Comparison:')\n",
+            "    print(f'   MAE (No K):    {df_eval[\"Error_No_K\"].mean()*100:.4f}%')\n",
+            "    print(f'   MAE (With K):  {df_eval[\"Error_With_K\"].mean()*100:.4f}%')\n",
+            "    if df_eval['Error_No_K'].mean() > 0:\n",
+            "        improvement = (df_eval['Error_No_K'].mean() - df_eval['Error_With_K'].mean()) / df_eval['Error_No_K'].mean() * 100\n",
+            "        print(f'   Improvement:   {improvement:.1f}%')\n",
+            "    print('='*60)"
+        ]
+    }
+]
+
+# Thêm cells mới vào cuối notebook
+nb['cells'].extend(new_cells)
+
+# Lưu notebook
+with open('notebooks/Markovchain_Cohort_Comparison.ipynb', 'w', encoding='utf-8') as f:
+    json.dump(nb, f, indent=1, ensure_ascii=False)
+
+print("✅ Đã tạo notebook: notebooks/Markovchain_Cohort_Comparison.ipynb")
+print("   - Copy từ Markovchain.ipynb")
+print("   - Thêm import forecast_segment_partial_step")
+print("   - Thêm section so sánh cohort từ MOB sớm")

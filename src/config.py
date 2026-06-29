@@ -77,7 +77,7 @@ MIN_EAD = 1e2         # Tổng dư nợ tối thiểu để build transition
 # - Nếu K_GLOBAL_MULTIPLIER = 0.8: Giảm 20% tất cả K values → forecast tăng chậm hơn
 # - Nếu K_GLOBAL_MULTIPLIER = 1.2: Tăng 20% tất cả K values → forecast tăng nhanh hơn
 # - Công thức: k_adjusted = k_calibrated * K_GLOBAL_MULTIPLIER (clip to [0, 1])
-K_GLOBAL_MULTIPLIER = 0.8  # Hệ số nhân chung (1.0 = không thay đổi)
+K_GLOBAL_MULTIPLIER = 1  # Hệ số nhân chung (1.0 = không thay đổi)
 
 # K_POST_MATURE: Giá trị K sử dụng cho MOB >= TARGET_MOB (sau khi mature)
 # - Nếu K_POST_MATURE = None: Sử dụng K từ calibration (k_final_by_mob)
@@ -85,6 +85,7 @@ K_GLOBAL_MULTIPLIER = 0.8  # Hệ số nhân chung (1.0 = không thay đổi)
 # - Giá trị khuyến nghị: 0.3 - 0.5 (để giảm slope sau mature)
 # - Lưu ý: K_POST_MATURE được áp dụng SAU K_GLOBAL_MULTIPLIER
 K_POST_MATURE = 0.03   # K value cho MOB >= TARGET_MOB (None = dùng calibrated K)
+K_POST_MATURE_DEL90 = None  # DEL90-specific post-mature K override (None = dùng calibrated K)
 # === BUCKETS CONFIG ===
 # Khai báo đầy đủ các buckets - code sẽ tự động filter chỉ lấy các cột có trong data
 BUCKETS_30P = ["DPD30+", "DPD60+", "DPD90+", "DPD120+", "DPD180+", "WRITEOFF"]
@@ -113,6 +114,7 @@ CFG = dict(
 # - SEGMENT_COLS = ["PRODUCT_TYPE", "RISK_SCORE", "GENDER"] => RISK_SCORE = "RISK_SCORE_GENDER"
 #SEGMENT_COLS = ["PRODUCT_TYPE", "RISK_SCORE", "GENDER", "LA_GROUP"] => RISK_SCORE = "RISK_SCORE_GENDER_LA_GROUP"
 #SEGMENT_COLS = ["PRODUCT_TYPE", "RISK_SCORE", "GENDER", "LA_GROUP"]  # Mặc định: giữ nguyên RISK_SCORE từ data
+#SEGMENT_COLS = ["PRODUCT_TYPE", "RISK_SCORE","SALE_CHANNEL"]
 SEGMENT_COLS = ["PRODUCT_TYPE", "RISK_SCORE"]
 def get_cohort_cols():
     """Trả về list columns để định nghĩa 1 cohort: SEGMENT_COLS + VINTAGE_DATE"""
@@ -187,9 +189,10 @@ DEFAULT = {"DPD90+"}
 # === MODEL CONFIG ===
 WEIGHT_METHOD = "exp"
 #WEIGHT_METHOD = None
-ROLL_WINDOW = 12
+ROLL_WINDOW = 20
+CFG["WEIGHT_METHOD"] = WEIGHT_METHOD
 CFG["ROLL_WINDOW"] = ROLL_WINDOW
-DECAY_LAMBDA = 0.5 ** (1/12)
+DECAY_LAMBDA = 0.5 ** (1/20)
 CFG["DECAY_LAMBDA"] = DECAY_LAMBDA
 # === MACRO & COLLX ADJUSTMENT CONFIG (optional, not wired by default) ===
 MACRO_INDICATORS = {

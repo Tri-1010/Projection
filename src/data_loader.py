@@ -22,9 +22,33 @@ def _read_parquet_dir(parquet_dir: Path) -> pd.DataFrame:
         files = sorted(parquet_dir.glob("*.parquet"))
         if not files:
             raise FileNotFoundError(f"Không tìm thấy *.parquet trong {parquet_dir}")
-        dfs = [pd.read_parquet(f) for f in files]
+        
+        # Đọc từng file với error handling
+        dfs = []
+        failed_files = []
+        for f in files:
+            try:
+                # Thử đọc với pyarrow engine trước
+                df_temp = pd.read_parquet(f, engine='pyarrow')
+                dfs.append(df_temp)
+            except Exception as e1:
+                try:
+                    # Nếu lỗi, thử với fastparquet
+                    print(f"   ⚠️ PyArrow failed for {f.name}, trying fastparquet...")
+                    df_temp = pd.read_parquet(f, engine='fastparquet')
+                    dfs.append(df_temp)
+                except Exception as e2:
+                    # Nếu cả 2 đều lỗi, bỏ qua file này
+                    print(f"   ❌ Failed to read {f.name}: {e1}")
+                    failed_files.append(f.name)
+        
+        if not dfs:
+            raise ValueError(f"Không đọc được file nào! Failed files: {failed_files}")
+        
         df = pd.concat(dfs, ignore_index=True)
-        print(f"✅ Loaded {len(df):,} rows from {len(files)} files in {parquet_dir}")
+        print(f"✅ Loaded {len(df):,} rows from {len(dfs)}/{len(files)} files")
+        if failed_files:
+            print(f"   ⚠️ Skipped {len(failed_files)} corrupted files: {failed_files[:3]}...")
         return df
 
 
