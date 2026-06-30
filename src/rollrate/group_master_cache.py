@@ -14,6 +14,7 @@ import src.config as project_config
 import src.rollrate.transition as transition_module
 from src.config import (
     BUCKETS_30P,
+    BUCKETS_60P,
     BUCKETS_90P,
     BUCKETS_CANON,
     CFG,
@@ -46,12 +47,13 @@ from src.rollrate.lifecycle import (
 from src.rollrate.lifecycle_export_enhanced import export_lifecycle_with_config_info
 from src.rollrate.oot_evaluation import (
     _run_del90_asof_forecast_for_vintage,
+    build_disb_total_by_vintage,
     prepare_backtest_frame,
 )
 from src.rollrate.transition import compute_transition_by_mob
 
 
-CACHE_FORMAT_VERSION = 6
+CACHE_FORMAT_VERSION = 7
 
 LIFECYCLE_MERGE_KEYS = ["PRODUCT_TYPE", "RISK_SCORE", "VINTAGE_DATE", "MOB"]
 DEL90_METRIC_COLS = ["DEL90_AMT", "DEL90_PCT"]
@@ -61,6 +63,7 @@ FAST_RECAL_STAGE_REQUIRED_FILES = (
 )
 
 DEFAULT_DEL90_BLEND_WEIGHT_GRID = [round(step * 0.05, 2) for step in range(21)]
+DEFAULT_DEL90_PROXY_RIDGE_GRID = [0.0, 0.01, 0.1, 1.0, 5.0, 10.0, 25.0]
 
 
 def get_default_settings() -> Dict:
@@ -132,6 +135,57 @@ def normalize_run_cfg(cfg: Dict) -> Dict:
     ).strip().lower()
     if run_cfg["del90_k_source"] not in {"del30", "del90", "blend"}:
         raise ValueError("del90_k_source must be 'del30', 'del90', or 'blend'")
+
+    raw_anchor_source_by_anchor = run_cfg.get("del90_anchor_source_by_anchor", {}) or {}
+    run_cfg["del90_anchor_source_by_anchor"] = {}
+    for anchor, source in raw_anchor_source_by_anchor.items():
+        source = str(source).strip().lower()
+        if source not in {"current", "del30", "del90"}:
+            raise ValueError(
+                "del90_anchor_source_by_anchor values must be 'current', 'del30', or 'del90'"
+            )
+        run_cfg["del90_anchor_source_by_anchor"][int(anchor)] = source
+
+    raw_proxy_source_by_anchor = run_cfg.get("del90_proxy_source_by_anchor", {}) or {}
+    run_cfg["del90_proxy_source_by_anchor"] = {}
+    for anchor, source in raw_proxy_source_by_anchor.items():
+        source = str(source).strip().lower()
+        if source not in {"del30", "del90"}:
+            raise ValueError(
+                "del90_proxy_source_by_anchor values must be 'del30' or 'del90'"
+            )
+        run_cfg["del90_proxy_source_by_anchor"][int(anchor)] = source
+    run_cfg["del90_proxy_enabled"] = bool(run_cfg["del90_proxy_source_by_anchor"])
+    run_cfg["del90_proxy_anchor_mobs"] = sorted(
+        {int(anchor) for anchor in run_cfg["del90_proxy_source_by_anchor"]}
+    )
+    run_cfg["del90_proxy_n_vintages"] = int(
+        run_cfg.get("del90_proxy_n_vintages", 6)
+    )
+    run_cfg["del90_proxy_min_vintages"] = int(
+        run_cfg.get("del90_proxy_min_vintages", 4)
+    )
+    run_cfg["del90_proxy_half_life_months"] = float(
+        run_cfg.get("del90_proxy_half_life_months", 3.0)
+    )
+    raw_proxy_ridge_grid = (
+        list(run_cfg.get("del90_proxy_ridge_grid", DEFAULT_DEL90_PROXY_RIDGE_GRID) or [])
+        or list(DEFAULT_DEL90_PROXY_RIDGE_GRID)
+    )
+    proxy_ridge_grid = []
+    for alpha in raw_proxy_ridge_grid:
+        alpha = float(alpha)
+        if np.isfinite(alpha) and alpha >= 0.0:
+            proxy_ridge_grid.append(alpha)
+    if not proxy_ridge_grid:
+        proxy_ridge_grid = list(DEFAULT_DEL90_PROXY_RIDGE_GRID)
+    run_cfg["del90_proxy_ridge_grid"] = sorted({round(alpha, 6) for alpha in proxy_ridge_grid})
+    run_cfg["del90_proxy_mae_guardrail"] = bool(
+        run_cfg.get("del90_proxy_mae_guardrail", True)
+    )
+    run_cfg["del90_proxy_enforce_del30_cap"] = bool(
+        run_cfg.get("del90_proxy_enforce_del30_cap", True)
+    )
 
     run_cfg["del90_portfolio_calibration_enabled"] = bool(
         run_cfg.get("del90_portfolio_calibration_enabled", False)
@@ -613,6 +667,100 @@ def _build_actual_max_mob_lookup(actual_results: Dict) -> Dict:
     }
 
 
+def _metric_rate_from_series(
+    state_series: pd.Series,
+    metric_states: Iterable[str],
+    disb_total: float,
+) -> float:
+    amount = float(state_series.reindex(list(metric_states), fill_value=0.0).sum())
+    if disb_total and disb_total > 0:
+        return amount / float(disb_total)
+    return np.nan
+
+
+def _build_anchor_feature_frame(
+    actual_results: Dict,
+    disb_total_by_vintage: Dict,
+) -> pd.DataFrame:
+    rows = []
+    for (product, score, vintage), mob_dict in actual_results.items():
+        if not mob_dict:
+            continue
+        actual_max_mob = int(max(mob_dict))
+        state_series = mob_dict[actual_max_mob]
+        disb_total = float(
+            disb_total_by_vintage.get((product, score, vintage), np.nan)
+        )
+        rows.append(
+            {
+                "PRODUCT_TYPE": str(product),
+                "RISK_SCORE": str(score),
+                "VINTAGE_DATE": pd.Timestamp(vintage),
+                "ACTUAL_MAX_MOB": actual_max_mob,
+                "DEL30_ANCHOR_PCT": _metric_rate_from_series(
+                    state_series,
+                    BUCKETS_30P,
+                    disb_total,
+                ),
+                "DEL60_ANCHOR_PCT": _metric_rate_from_series(
+                    state_series,
+                    BUCKETS_60P,
+                    disb_total,
+                ),
+                "DEL90_ANCHOR_PCT": _metric_rate_from_series(
+                    state_series,
+                    BUCKETS_90P,
+                    disb_total,
+                ),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _attach_del90_variant_base_columns(
+    df_lifecycle: pd.DataFrame,
+    del90_variant_frames: Dict[str, pd.DataFrame],
+) -> pd.DataFrame:
+    out = df_lifecycle.copy()
+    for variant_source in ("del30", "del90"):
+        variant_df = del90_variant_frames.get(variant_source)
+        if variant_df is None:
+            continue
+        suffix = "DEL30K" if variant_source == "del30" else "DEL90K"
+        variant_cols = variant_df[
+            LIFECYCLE_MERGE_KEYS + ["DEL90_AMT", "DEL90_PCT"]
+        ].rename(
+            columns={
+                "DEL90_AMT": f"DEL90_AMT_{suffix}_BASE",
+                "DEL90_PCT": f"DEL90_PCT_{suffix}_BASE",
+            }
+        )
+        out = out.merge(
+            variant_cols,
+            on=LIFECYCLE_MERGE_KEYS,
+            how="left",
+            validate="one_to_one",
+        )
+        pct_col = f"DEL90_PCT_{suffix}_BASE"
+        amt_col = f"DEL90_AMT_{suffix}_BASE"
+        if out[pct_col].isna().any() or out[amt_col].isna().any():
+            raise ValueError(
+                f"DEL90 variant merge produced missing values for {suffix} base columns"
+            )
+    return out
+
+
+def _resolve_del90_source_pred_column(source: str) -> str:
+    source = str(source).strip().lower()
+    if source == "current":
+        return "DEL90_PCT"
+    if source == "del30":
+        return "DEL90_PCT_DEL30K_BASE"
+    if source == "del90":
+        return "DEL90_PCT_DEL90K_BASE"
+    raise ValueError(f"Unsupported DEL90 source: {source!r}")
+
+
 def _merge_del90_compare_variants(
     compare_del30: pd.DataFrame,
     compare_del90: pd.DataFrame,
@@ -645,6 +793,121 @@ def _merge_del90_compare_variants(
         validate="one_to_one",
     )
     return merged
+
+
+def _weighted_month_diff(newer: pd.Timestamp, older: pd.Timestamp) -> float:
+    newer = pd.Timestamp(newer)
+    older = pd.Timestamp(older)
+    return float((newer.year - older.year) * 12 + newer.month - older.month)
+
+
+def _prepare_weighted_design(
+    df: pd.DataFrame,
+    feature_cols: List[str],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, pd.Series, pd.Series]:
+    x = df[feature_cols].astype(float).copy()
+    y = df["ACTUAL_PCT"].astype(float).to_numpy()
+    w = df["SAMPLE_WEIGHT"].astype(float).to_numpy()
+    means = x.mean(axis=0)
+    stds = x.std(axis=0).replace(0.0, 1.0).fillna(1.0)
+    xs = (x - means) / stds
+    return xs.to_numpy(), y, w, means, stds
+
+
+def _fit_weighted_ridge_predict(
+    train_df: pd.DataFrame,
+    pred_df: pd.DataFrame,
+    feature_cols: List[str],
+    ridge_alpha: float,
+) -> tuple[np.ndarray, Dict[str, float]]:
+    x_train, y_train, w_train, means, stds = _prepare_weighted_design(
+        train_df,
+        feature_cols,
+    )
+    x_pred = ((pred_df[feature_cols].astype(float) - means) / stds).to_numpy()
+    z_train = np.column_stack([np.ones(len(x_train)), x_train])
+    z_pred = np.column_stack([np.ones(len(x_pred)), x_pred])
+    weight_diag = np.diag(w_train)
+    penalty = np.eye(z_train.shape[1], dtype=float)
+    penalty[0, 0] = 0.0
+    beta = np.linalg.pinv(
+        z_train.T @ weight_diag @ z_train + float(ridge_alpha) * penalty
+    ) @ (z_train.T @ weight_diag @ y_train)
+    pred = np.clip(z_pred @ beta, 0.0, 1.0)
+    coef_map = {"INTERCEPT": float(beta[0])}
+    for idx, col in enumerate(feature_cols, start=1):
+        coef_map[col] = float(beta[idx])
+    return pred, coef_map
+
+
+def _select_proxy_ridge_alpha(
+    cal_df: pd.DataFrame,
+    feature_cols: List[str],
+    ridge_grid: List[float],
+) -> tuple[float, float, float]:
+    vintages = sorted(pd.to_datetime(cal_df["TARGET_VINTAGE"]).drop_duplicates())
+    base_fold_rows = []
+    best_alpha = float(ridge_grid[-1]) if ridge_grid else 10.0
+    best_score = np.inf
+    for holdout_vintage in vintages:
+        train_df = cal_df[cal_df["TARGET_VINTAGE"] != holdout_vintage].copy()
+        holdout_df = cal_df[cal_df["TARGET_VINTAGE"] == holdout_vintage].copy()
+        if train_df.empty or holdout_df.empty:
+            continue
+        weights = holdout_df["DISB_TOTAL"].fillna(0.0).astype(float).to_numpy()
+        actual = holdout_df["ACTUAL_PCT"].astype(float).to_numpy()
+        base_pred = holdout_df["PRED_PCT"].astype(float).to_numpy()
+        base_mae = (
+            float(np.average(np.abs(base_pred - actual), weights=weights))
+            if bool((weights > 0).any())
+            else float(np.abs(base_pred - actual).mean())
+        )
+        base_fold_rows.append({"WEIGHT": float(weights.sum()), "MAE": base_mae})
+
+    base_cv_mae = (
+        float(
+            np.average(
+                [row["MAE"] for row in base_fold_rows],
+                weights=[row["WEIGHT"] for row in base_fold_rows],
+            )
+        )
+        if base_fold_rows
+        else np.inf
+    )
+
+    for alpha in ridge_grid:
+        fold_rows = []
+        for holdout_vintage in vintages:
+            train_df = cal_df[cal_df["TARGET_VINTAGE"] != holdout_vintage].copy()
+            holdout_df = cal_df[cal_df["TARGET_VINTAGE"] == holdout_vintage].copy()
+            if train_df.empty or holdout_df.empty:
+                continue
+            pred, _ = _fit_weighted_ridge_predict(
+                train_df,
+                holdout_df,
+                feature_cols,
+                float(alpha),
+            )
+            weights = holdout_df["DISB_TOTAL"].fillna(0.0).astype(float).to_numpy()
+            actual = holdout_df["ACTUAL_PCT"].astype(float).to_numpy()
+            mae = (
+                float(np.average(np.abs(pred - actual), weights=weights))
+                if bool((weights > 0).any())
+                else float(np.abs(pred - actual).mean())
+            )
+            fold_rows.append({"WEIGHT": float(weights.sum()), "MAE": mae})
+        if not fold_rows:
+            continue
+        score = float(
+            np.average(
+                [row["MAE"] for row in fold_rows],
+                weights=[row["WEIGHT"] for row in fold_rows],
+            )
+        )
+        if score < best_score - 1e-12:
+            best_alpha = float(alpha)
+            best_score = score
+    return best_alpha, float(best_score), float(base_cv_mae)
 
 
 def _interp_blend_weight_for_anchor(
@@ -742,6 +1005,56 @@ def _run_del90_blend_asof_forecast_for_vintage(
     compare_df["SQ_ERROR"] = compare_df["ERROR"] ** 2
 
     result = dict(result_del30)
+    result["compare_df"] = compare_df
+    return result
+
+
+def _run_del90_proxy_asof_forecast_for_vintage(
+    df_model: pd.DataFrame,
+    *,
+    vintage,
+    target_mob: int,
+    lookback_months: int,
+    fit_params: Dict,
+    k_source: str,
+) -> Dict:
+    result = _run_del90_asof_forecast_for_vintage(
+        df_model,
+        vintage=vintage,
+        target_mob=target_mob,
+        lookback_months=lookback_months,
+        fit_params=fit_params,
+        k_source=k_source,
+    )
+    compare_df = result["compare_df"].copy()
+    if compare_df.empty:
+        return result
+
+    actual_results_anchor = get_actual_all_vintages_amount(result["df_target_anchor"])
+    disb_total_target = build_disb_total_by_vintage(result["df_target_actual"])
+    anchor_feature_df = _build_anchor_feature_frame(
+        actual_results_anchor,
+        disb_total_target,
+    )[
+        [
+            "PRODUCT_TYPE",
+            "RISK_SCORE",
+            "VINTAGE_DATE",
+            "ACTUAL_MAX_MOB",
+            "DEL30_ANCHOR_PCT",
+            "DEL60_ANCHOR_PCT",
+            "DEL90_ANCHOR_PCT",
+        ]
+    ]
+    compare_df = compare_df.merge(
+        anchor_feature_df,
+        on=["PRODUCT_TYPE", "RISK_SCORE", "VINTAGE_DATE"],
+        how="left",
+        validate="one_to_one",
+    )
+    if compare_df[["DEL30_ANCHOR_PCT", "DEL60_ANCHOR_PCT"]].isna().any().any():
+        raise ValueError("DEL90 proxy merge produced missing anchor feature values")
+    result = dict(result)
     result["compare_df"] = compare_df
     return result
 
@@ -1461,6 +1774,287 @@ def _apply_del90_portfolio_calibration(
     return out
 
 
+def _build_del90_proxy_curve(
+    df_raw_unsegmented: pd.DataFrame,
+    run_cfg: Dict,
+) -> pd.DataFrame:
+    columns = [
+        "TARGET_MOB",
+        "ANCHOR_MOB",
+        "LOOKBACK_MONTHS",
+        "SOURCE_VARIANT",
+        "N_CALIBRATION_VINTAGES",
+        "CALIBRATION_VINTAGES",
+        "RIDGE_ALPHA",
+        "RIDGE_CV_MAE",
+        "BASE_CV_MAE",
+        "STATUS",
+        "INTERCEPT",
+        "COEF_BASE_PRED",
+        "COEF_DEL30_ANCHOR",
+        "COEF_DEL60_ANCHOR",
+    ]
+    if not run_cfg.get("del90_proxy_enabled", False):
+        return pd.DataFrame(columns=columns)
+
+    df_model = prepare_backtest_frame(
+        df_raw_unsegmented,
+        product_filter=run_cfg.get("product_filter"),
+        risk_filter=run_cfg.get("risk_filter"),
+    )
+    df_model[CFG["cutoff"]] = parse_date_column(df_model[CFG["cutoff"]])
+    df_model[CFG["mob"]] = pd.to_numeric(df_model[CFG["mob"]], errors="coerce")
+
+    fit_params = {
+        "k_method": run_cfg.get("k_method", "wls_reg"),
+        "lambda_k": float(run_cfg.get("lambda_k", 1e-4)),
+        "k_prior": float(run_cfg.get("k_prior", 0.0)),
+        "k_min_obs": int(run_cfg.get("k_min_obs", 5)),
+        "fallback_k": float(run_cfg.get("fallback_k", 1.0)),
+        "fallback_weight": float(run_cfg.get("fallback_weight", 0.0)),
+        "gamma": float(run_cfg.get("gamma", 10.0)),
+        "alpha_mob_target": int(
+            run_cfg.get("alpha_mob_target", max(run_cfg["target_mobs"]))
+        ),
+        "k_weight_mode": run_cfg.get("k_weight_mode", "equal"),
+        "monotone": bool(run_cfg.get("monotone", False)),
+    }
+    half_life = float(run_cfg["del90_proxy_half_life_months"])
+    min_vintages = int(run_cfg["del90_proxy_min_vintages"])
+    ridge_grid = [float(alpha) for alpha in run_cfg["del90_proxy_ridge_grid"]]
+    feature_cols = ["PRED_PCT", "DEL30_ANCHOR_PCT", "DEL60_ANCHOR_PCT"]
+    rows = []
+
+    for target_mob in run_cfg["target_mobs"]:
+        target_candidates = (
+            df_model[df_model[CFG["mob"]] == int(target_mob)]
+            .groupby("VINTAGE_DATE")[CFG["cutoff"]]
+            .max()
+            .sort_index()
+        )
+        if target_candidates.empty:
+            continue
+
+        valid_anchor_mobs = [
+            mob
+            for mob in run_cfg["del90_proxy_anchor_mobs"]
+            if 0 <= int(mob) < int(target_mob)
+        ]
+        for anchor_mob in valid_anchor_mobs:
+            source_variant = run_cfg["del90_proxy_source_by_anchor"].get(anchor_mob)
+            if source_variant is None:
+                continue
+            lookback_months = int(target_mob) - int(anchor_mob)
+            calibration_vintages = target_candidates.tail(
+                run_cfg["del90_proxy_n_vintages"]
+            ).index
+            compare_frames = []
+            used_vintages = []
+            for vintage in calibration_vintages:
+                try:
+                    result = _run_del90_proxy_asof_forecast_for_vintage(
+                        df_model,
+                        vintage=vintage,
+                        target_mob=int(target_mob),
+                        lookback_months=lookback_months,
+                        fit_params=fit_params,
+                        k_source=source_variant,
+                    )
+                except ValueError as exc:
+                    print(
+                        f"[WARN] Skip DEL90 proxy vintage {pd.Timestamp(vintage):%Y-%m-%d} "
+                        f"at anchor MOB{anchor_mob}: {exc}"
+                    )
+                    continue
+                if result["compare_df"].empty:
+                    continue
+                compare = result["compare_df"].copy()
+                compare["CALIBRATION_VINTAGE"] = pd.Timestamp(vintage)
+                compare_frames.append(compare)
+                used_vintages.append(pd.Timestamp(vintage))
+
+            if len(used_vintages) < min_vintages:
+                continue
+
+            compare_df = pd.concat(compare_frames, ignore_index=True)
+            newest_vintage = max(used_vintages)
+            compare_df["VINTAGE_AGE_MONTHS"] = compare_df["TARGET_VINTAGE"].apply(
+                lambda value: _weighted_month_diff(newest_vintage, pd.Timestamp(value))
+            )
+            if half_life > 0:
+                compare_df["RECENCY_WEIGHT"] = np.power(
+                    0.5,
+                    compare_df["VINTAGE_AGE_MONTHS"].astype(float) / half_life,
+                )
+            else:
+                compare_df["RECENCY_WEIGHT"] = 1.0
+            compare_df["SAMPLE_WEIGHT"] = (
+                compare_df["DISB_TOTAL"].fillna(0.0).astype(float)
+                * compare_df["RECENCY_WEIGHT"].astype(float)
+            )
+            best_alpha, best_score, base_score = _select_proxy_ridge_alpha(
+                compare_df,
+                feature_cols,
+                ridge_grid,
+            )
+            _, coef_map = _fit_weighted_ridge_predict(
+                compare_df,
+                compare_df,
+                feature_cols,
+                best_alpha,
+            )
+            status = "applied"
+            if run_cfg["del90_proxy_mae_guardrail"] and not (
+                best_score <= base_score + 1e-12
+            ):
+                status = "guardrail_rejected"
+
+            rows.append(
+                {
+                    "TARGET_MOB": int(target_mob),
+                    "ANCHOR_MOB": int(anchor_mob),
+                    "LOOKBACK_MONTHS": lookback_months,
+                    "SOURCE_VARIANT": source_variant,
+                    "N_CALIBRATION_VINTAGES": len(used_vintages),
+                    "CALIBRATION_VINTAGES": ",".join(
+                        vintage.strftime("%Y-%m-%d") for vintage in used_vintages
+                    ),
+                    "RIDGE_ALPHA": float(best_alpha),
+                    "RIDGE_CV_MAE": float(best_score),
+                    "BASE_CV_MAE": float(base_score),
+                    "STATUS": status,
+                    "INTERCEPT": float(coef_map["INTERCEPT"]),
+                    "COEF_BASE_PRED": float(coef_map["PRED_PCT"]),
+                    "COEF_DEL30_ANCHOR": float(coef_map["DEL30_ANCHOR_PCT"]),
+                    "COEF_DEL60_ANCHOR": float(coef_map["DEL60_ANCHOR_PCT"]),
+                }
+            )
+
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _apply_del90_anchor_source_routing(
+    df_lifecycle: pd.DataFrame,
+    actual_results: Dict,
+    run_cfg: Dict,
+) -> pd.DataFrame:
+    route_map = run_cfg.get("del90_anchor_source_by_anchor", {}) or {}
+    out = df_lifecycle.copy()
+    out["DEL90_ROUTE_SOURCE"] = "current"
+    out["DEL90_ROUTE_ANCHOR_MOB"] = np.nan
+    out["DEL90_ROUTE_APPLIED"] = 0
+    if not route_map:
+        return out
+
+    actual_max_mob = _build_actual_max_mob_lookup(actual_results)
+    out["_ACTUAL_MAX_MOB"] = [
+        actual_max_mob.get((str(product), str(score), pd.Timestamp(vintage)), -1)
+        for product, score, vintage in zip(
+            out["PRODUCT_TYPE"],
+            out["RISK_SCORE"],
+            out["VINTAGE_DATE"],
+        )
+    ]
+
+    for target_mob in run_cfg["target_mobs"]:
+        mask_target = (
+            (out["MOB"] == int(target_mob))
+            & (out["IS_FORECAST"].astype(int) == 1)
+            & (out["_ACTUAL_MAX_MOB"] < int(target_mob))
+        )
+        if not mask_target.any():
+            continue
+        for anchor_mob, source in route_map.items():
+            source_col = _resolve_del90_source_pred_column(source)
+            if source_col not in out.columns:
+                raise KeyError(
+                    f"DEL90 anchor routing requires column {source_col}, but it is missing"
+                )
+            mask = mask_target & (out["_ACTUAL_MAX_MOB"] == int(anchor_mob))
+            if not mask.any():
+                continue
+            out.loc[mask, "DEL90_PCT"] = out.loc[mask, source_col].astype(float).clip(0.0, 1.0)
+            out.loc[mask, "DEL90_AMT"] = (
+                out.loc[mask, "DEL90_PCT"].astype(float)
+                * out.loc[mask, "DISB_TOTAL"].astype(float)
+            )
+            out.loc[mask, "DEL90_ROUTE_SOURCE"] = source
+            out.loc[mask, "DEL90_ROUTE_ANCHOR_MOB"] = int(anchor_mob)
+            out.loc[mask, "DEL90_ROUTE_APPLIED"] = 1
+
+    out = out.drop(columns=["_ACTUAL_MAX_MOB"])
+    return out
+
+
+def _apply_del90_proxy_curve(
+    df_lifecycle: pd.DataFrame,
+    actual_results: Dict,
+    disb_total_by_vintage: Dict,
+    proxy_curve: pd.DataFrame,
+    enforce_del30_cap: bool = True,
+) -> pd.DataFrame:
+    out = df_lifecycle.copy()
+    out["DEL90_PROXY_SOURCE"] = ""
+    out["DEL90_PROXY_ANCHOR_MOB"] = np.nan
+    out["DEL90_PROXY_APPLIED"] = 0
+    if proxy_curve.empty:
+        return out
+
+    anchor_feature_df = _build_anchor_feature_frame(actual_results, disb_total_by_vintage)
+    out = out.merge(
+        anchor_feature_df,
+        on=["PRODUCT_TYPE", "RISK_SCORE", "VINTAGE_DATE"],
+        how="left",
+        validate="many_to_one",
+    )
+
+    for row in proxy_curve.itertuples(index=False):
+        if str(row.STATUS) != "applied":
+            continue
+        source_col = _resolve_del90_source_pred_column(row.SOURCE_VARIANT)
+        if source_col not in out.columns:
+            raise KeyError(
+                f"DEL90 proxy requires column {source_col}, but it is missing"
+            )
+        mask = (
+            (out["MOB"] == int(row.TARGET_MOB))
+            & (out["IS_FORECAST"].astype(int) == 1)
+            & (out["ACTUAL_MAX_MOB"] == int(row.ANCHOR_MOB))
+        )
+        if not mask.any():
+            continue
+        pred = (
+            float(row.INTERCEPT)
+            + float(row.COEF_BASE_PRED) * out.loc[mask, source_col].astype(float).to_numpy()
+            + float(row.COEF_DEL30_ANCHOR) * out.loc[mask, "DEL30_ANCHOR_PCT"].astype(float).to_numpy()
+            + float(row.COEF_DEL60_ANCHOR) * out.loc[mask, "DEL60_ANCHOR_PCT"].astype(float).to_numpy()
+        )
+        pred = np.clip(pred, 0.0, 1.0)
+        if enforce_del30_cap and "DEL30_PCT" in out.columns:
+            pred = np.minimum(
+                pred,
+                out.loc[mask, "DEL30_PCT"].astype(float).clip(0.0, 1.0).to_numpy(),
+            )
+        out.loc[mask, "DEL90_PCT"] = pred
+        out.loc[mask, "DEL90_AMT"] = (
+            out.loc[mask, "DEL90_PCT"].astype(float)
+            * out.loc[mask, "DISB_TOTAL"].astype(float)
+        )
+        out.loc[mask, "DEL90_PROXY_SOURCE"] = str(row.SOURCE_VARIANT)
+        out.loc[mask, "DEL90_PROXY_ANCHOR_MOB"] = int(row.ANCHOR_MOB)
+        out.loc[mask, "DEL90_PROXY_APPLIED"] = 1
+
+    return out.drop(
+        columns=[
+            "ACTUAL_MAX_MOB",
+            "DEL30_ANCHOR_PCT",
+            "DEL60_ANCHOR_PCT",
+            "DEL90_ANCHOR_PCT",
+        ],
+        errors="ignore",
+    )
+
+
 def _merge_del90_metrics(
     df_lifecycle_del30: pd.DataFrame,
     df_lifecycle_del90: pd.DataFrame,
@@ -1542,6 +2136,14 @@ def _build_config_params(run_cfg: Dict) -> Dict:
         "DEL90_BLEND_HALF_LIFE_MONTHS": run_cfg["del90_blend_half_life_months"],
         "DEL90_BLEND_OBJECTIVE": run_cfg["del90_blend_objective"],
         "DEL90_BLEND_FALLBACK_WEIGHT": run_cfg["del90_blend_fallback_weight"],
+        "DEL90_ANCHOR_SOURCE_BY_ANCHOR": run_cfg["del90_anchor_source_by_anchor"],
+        "DEL90_PROXY_ENABLED": run_cfg["del90_proxy_enabled"],
+        "DEL90_PROXY_SOURCE_BY_ANCHOR": run_cfg["del90_proxy_source_by_anchor"],
+        "DEL90_PROXY_N_VINTAGES": run_cfg["del90_proxy_n_vintages"],
+        "DEL90_PROXY_MIN_VINTAGES": run_cfg["del90_proxy_min_vintages"],
+        "DEL90_PROXY_HALF_LIFE_MONTHS": run_cfg["del90_proxy_half_life_months"],
+        "DEL90_PROXY_RIDGE_GRID": run_cfg["del90_proxy_ridge_grid"],
+        "DEL90_PROXY_MAE_GUARDRAIL": run_cfg["del90_proxy_mae_guardrail"],
     }
 
 
@@ -1567,6 +2169,11 @@ def _validate_fast_recalibration_stage(
     stage_manifest: Dict,
     run_cfg: Dict,
 ) -> None:
+    if run_cfg.get("del90_proxy_enabled") or run_cfg.get("del90_anchor_source_by_anchor"):
+        raise ValueError(
+            "Fast recalibration does not support DEL90 anchor routing/proxy. "
+            "Run a full group pipeline instead."
+        )
     staged_cfg = normalize_run_cfg(stage_manifest.get("config", {}))
     keys_to_match = [
         "name",
@@ -1999,9 +2606,14 @@ def run_group_pipeline(
         k_curve_del30["K_SOURCE_VARIANT"] = "DEL30"
         del90_variant_frames = {}
         del90_variant_curves = []
+        route_requires_both_variants = bool(
+            run_cfg.get("del90_anchor_source_by_anchor")
+            or run_cfg.get("del90_proxy_enabled")
+            or run_cfg["del90_k_source"] == "blend"
+        )
         variant_sources = (
             ["del30", "del90"]
-            if run_cfg["del90_k_source"] == "blend"
+            if route_requires_both_variants
             else [run_cfg["del90_k_source"]]
         )
         for variant_source in variant_sources:
@@ -2060,6 +2672,37 @@ def run_group_pipeline(
             calibration_curve=del90_calibration_curve,
             enforce_del30_cap=run_cfg["del90_calibration_enforce_del30_cap"],
         )
+        del90_proxy_curve = pd.DataFrame()
+        if run_cfg.get("del90_anchor_source_by_anchor") or run_cfg.get("del90_proxy_enabled"):
+            df_lifecycle_final = _attach_del90_variant_base_columns(
+                df_lifecycle_final,
+                del90_variant_frames,
+            )
+            df_lifecycle_final = _apply_del90_anchor_source_routing(
+                df_lifecycle_final,
+                actual_results=actual_results,
+                run_cfg=run_cfg,
+            )
+            del90_proxy_curve = _build_del90_proxy_curve(
+                df_raw_unsegmented=df_raw_source,
+                run_cfg=run_cfg,
+            )
+            df_lifecycle_final = _apply_del90_proxy_curve(
+                df_lifecycle=df_lifecycle_final,
+                actual_results=actual_results,
+                disb_total_by_vintage=disb_total_by_vintage,
+                proxy_curve=del90_proxy_curve,
+                enforce_del30_cap=run_cfg["del90_proxy_enforce_del30_cap"],
+            )
+            df_lifecycle_final = df_lifecycle_final.drop(
+                columns=[
+                    "DEL90_PCT_DEL30K_BASE",
+                    "DEL90_AMT_DEL30K_BASE",
+                    "DEL90_PCT_DEL90K_BASE",
+                    "DEL90_AMT_DEL90K_BASE",
+                ],
+                errors="ignore",
+            )
 
         df_product = aggregate_to_product(df_lifecycle_final)
         df_portfolio = aggregate_products_to_portfolio(
@@ -2085,6 +2728,7 @@ def run_group_pipeline(
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         calibration_curve_file = None
         blend_curve_file = None
+        proxy_curve_file = None
         if not del90_blend_curve.empty:
             blend_curve_file = (
                 group_output_dir
@@ -2102,6 +2746,16 @@ def run_group_pipeline(
             )
             del90_calibration_curve.to_csv(
                 calibration_curve_file,
+                index=False,
+                encoding="utf-8-sig",
+            )
+        if not del90_proxy_curve.empty:
+            proxy_curve_file = (
+                group_output_dir
+                / f"{run_cfg['name']}_DEL90_Proxy_{timestamp}.csv"
+            )
+            del90_proxy_curve.to_csv(
+                proxy_curve_file,
                 index=False,
                 encoding="utf-8-sig",
             )
@@ -2163,6 +2817,9 @@ def run_group_pipeline(
             "del90_blend_curve": str(
                 save_frame(del90_blend_curve, stage_dir / "del90_blend_curve")
             ),
+            "del90_proxy_curve": str(
+                save_frame(del90_proxy_curve, stage_dir / "del90_proxy_curve")
+            ),
             "k_curve": str(save_frame(k_curve_df, stage_dir / "k_curve")),
         }
 
@@ -2193,6 +2850,8 @@ def run_group_pipeline(
                 else "disabled"
             ),
             "DEL90_CALIBRATION_ROWS": len(del90_calibration_curve),
+            "DEL90_PROXY_ROWS": len(del90_proxy_curve),
+            "DEL90_PROXY_FILE": str(proxy_curve_file) if proxy_curve_file else "-",
             "DEL90_CALIBRATION_GUARDRAIL_REJECTED": int(
                 (
                     del90_calibration_curve.get("STATUS", pd.Series(dtype=str))

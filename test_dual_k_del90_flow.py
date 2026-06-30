@@ -6,7 +6,9 @@ import pandas as pd
 from src.config import CFG
 from src.rollrate.group_master_cache import (
     _apply_del90_blend,
+    _apply_del90_anchor_source_routing,
     _apply_del90_portfolio_calibration,
+    _apply_del90_proxy_curve,
     _attach_del90_calibration_drift,
     _build_del90_blend_curve,
     _build_metric_lifecycle,
@@ -328,6 +330,185 @@ def test_apply_del90_blend_convex_combination():
     assert int(row["DEL90_BLEND_APPLIED"]) == 1
 
 
+def test_apply_del90_anchor_source_routing_overrides_exact_anchor_only():
+    vintage_3 = pd.Timestamp("2024-01-01")
+    vintage_5 = pd.Timestamp("2024-02-01")
+    vintage_2 = pd.Timestamp("2024-03-01")
+    lifecycle = pd.DataFrame(
+        [
+            {
+                "PRODUCT_TYPE": "PL",
+                "RISK_SCORE": "A",
+                "VINTAGE_DATE": vintage_3,
+                "MOB": 12,
+                "IS_FORECAST": 1,
+                "DISB_TOTAL": 100.0,
+                "DEL90_PCT": 0.12,
+                "DEL90_AMT": 12.0,
+                "DEL90_PCT_DEL30K_BASE": 0.20,
+                "DEL90_AMT_DEL30K_BASE": 20.0,
+                "DEL90_PCT_DEL90K_BASE": 0.08,
+                "DEL90_AMT_DEL90K_BASE": 8.0,
+            },
+            {
+                "PRODUCT_TYPE": "PL",
+                "RISK_SCORE": "A",
+                "VINTAGE_DATE": vintage_5,
+                "MOB": 12,
+                "IS_FORECAST": 1,
+                "DISB_TOTAL": 100.0,
+                "DEL90_PCT": 0.12,
+                "DEL90_AMT": 12.0,
+                "DEL90_PCT_DEL30K_BASE": 0.18,
+                "DEL90_AMT_DEL30K_BASE": 18.0,
+                "DEL90_PCT_DEL90K_BASE": 0.30,
+                "DEL90_AMT_DEL90K_BASE": 30.0,
+            },
+            {
+                "PRODUCT_TYPE": "PL",
+                "RISK_SCORE": "A",
+                "VINTAGE_DATE": vintage_2,
+                "MOB": 12,
+                "IS_FORECAST": 1,
+                "DISB_TOTAL": 100.0,
+                "DEL90_PCT": 0.14,
+                "DEL90_AMT": 14.0,
+                "DEL90_PCT_DEL30K_BASE": 0.25,
+                "DEL90_AMT_DEL30K_BASE": 25.0,
+                "DEL90_PCT_DEL90K_BASE": 0.28,
+                "DEL90_AMT_DEL90K_BASE": 28.0,
+            },
+        ]
+    )
+    actual_results = {
+        ("PL", "A", vintage_3): {
+            0: pd.Series(dtype=float),
+            3: pd.Series(dtype=float),
+        },
+        ("PL", "A", vintage_5): {
+            0: pd.Series(dtype=float),
+            5: pd.Series(dtype=float),
+        },
+        ("PL", "A", vintage_2): {
+            0: pd.Series(dtype=float),
+            2: pd.Series(dtype=float),
+        },
+    }
+    run_cfg = {
+        "target_mobs": [12],
+        "del90_anchor_source_by_anchor": {3: "del30", 5: "del90"},
+    }
+
+    result = _apply_del90_anchor_source_routing(
+        lifecycle,
+        actual_results=actual_results,
+        run_cfg=run_cfg,
+    )
+
+    routed_3 = result[result["VINTAGE_DATE"] == vintage_3].iloc[0]
+    routed_5 = result[result["VINTAGE_DATE"] == vintage_5].iloc[0]
+    untouched_2 = result[result["VINTAGE_DATE"] == vintage_2].iloc[0]
+
+    assert abs(float(routed_3["DEL90_PCT"]) - 0.20) < 1e-12
+    assert abs(float(routed_5["DEL90_PCT"]) - 0.30) < 1e-12
+    assert abs(float(untouched_2["DEL90_PCT"]) - 0.14) < 1e-12
+    assert str(routed_3["DEL90_ROUTE_SOURCE"]) == "del30"
+    assert str(routed_5["DEL90_ROUTE_SOURCE"]) == "del90"
+    assert int(untouched_2["DEL90_ROUTE_APPLIED"]) == 0
+
+
+def test_apply_del90_proxy_curve_overrides_exact_anchor_only():
+    vintage_3 = pd.Timestamp("2024-01-01")
+    vintage_4 = pd.Timestamp("2024-02-01")
+    lifecycle = pd.DataFrame(
+        [
+            {
+                "PRODUCT_TYPE": "PL",
+                "RISK_SCORE": "A",
+                "VINTAGE_DATE": vintage_3,
+                "MOB": 12,
+                "IS_FORECAST": 1,
+                "DISB_TOTAL": 100.0,
+                "DEL30_PCT": 0.50,
+                "DEL90_PCT": 0.18,
+                "DEL90_AMT": 18.0,
+                "DEL90_PCT_DEL30K_BASE": 0.20,
+                "DEL90_AMT_DEL30K_BASE": 20.0,
+            },
+            {
+                "PRODUCT_TYPE": "PL",
+                "RISK_SCORE": "A",
+                "VINTAGE_DATE": vintage_4,
+                "MOB": 12,
+                "IS_FORECAST": 1,
+                "DISB_TOTAL": 100.0,
+                "DEL30_PCT": 0.50,
+                "DEL90_PCT": 0.18,
+                "DEL90_AMT": 18.0,
+                "DEL90_PCT_DEL30K_BASE": 0.22,
+                "DEL90_AMT_DEL30K_BASE": 22.0,
+            },
+        ]
+    )
+    actual_results = {
+        ("PL", "A", vintage_3): {
+            3: pd.Series(
+                {
+                    "DPD30+": 20.0,
+                    "DPD60+": 10.0,
+                    "DPD90+": 5.0,
+                }
+            ),
+        },
+        ("PL", "A", vintage_4): {
+            4: pd.Series(
+                {
+                    "DPD30+": 12.0,
+                    "DPD60+": 4.0,
+                    "DPD90+": 1.0,
+                }
+            ),
+        },
+    }
+    disb_total_by_vintage = {
+        ("PL", "A", vintage_3): 100.0,
+        ("PL", "A", vintage_4): 100.0,
+    }
+    proxy_curve = pd.DataFrame(
+        [
+            {
+                "TARGET_MOB": 12,
+                "ANCHOR_MOB": 3,
+                "SOURCE_VARIANT": "del30",
+                "STATUS": "applied",
+                "INTERCEPT": 0.01,
+                "COEF_BASE_PRED": 1.0,
+                "COEF_DEL30_ANCHOR": 0.5,
+                "COEF_DEL60_ANCHOR": 0.25,
+            }
+        ]
+    )
+
+    result = _apply_del90_proxy_curve(
+        lifecycle,
+        actual_results=actual_results,
+        disb_total_by_vintage=disb_total_by_vintage,
+        proxy_curve=proxy_curve,
+        enforce_del30_cap=True,
+    )
+
+    proxied = result[result["VINTAGE_DATE"] == vintage_3].iloc[0]
+    untouched = result[result["VINTAGE_DATE"] == vintage_4].iloc[0]
+
+    expected_pct = 0.01 + 1.0 * 0.20 + 0.5 * 0.35 + 0.25 * 0.15
+    assert abs(float(proxied["DEL90_PCT"]) - expected_pct) < 1e-12
+    assert abs(float(proxied["DEL90_AMT"]) - expected_pct * 100.0) < 1e-12
+    assert str(proxied["DEL90_PROXY_SOURCE"]) == "del30"
+    assert int(proxied["DEL90_PROXY_APPLIED"]) == 1
+    assert abs(float(untouched["DEL90_PCT"]) - 0.18) < 1e-12
+    assert int(untouched["DEL90_PROXY_APPLIED"]) == 0
+
+
 def test_build_del90_blend_curve_prefers_del30_early_and_allows_del90_later():
     df_raw = build_blend_curve_raw()
     run_cfg = {
@@ -645,6 +826,8 @@ def main():
     test_portfolio_calibration_changes_forecast_only()
     test_calibration_drift_warning()
     test_apply_del90_blend_convex_combination()
+    test_apply_del90_anchor_source_routing_overrides_exact_anchor_only()
+    test_apply_del90_proxy_curve_overrides_exact_anchor_only()
     test_build_del90_blend_curve_prefers_del30_early_and_allows_del90_later()
     test_run_group_pipeline_hybrid_schema()
     test_recalibrate_existing_loan_forecast_del90_matches_target()
